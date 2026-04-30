@@ -1,0 +1,185 @@
+# ProxyLLM Kubernetes 部署示例
+# 使用前请根据实际环境修改配置
+
+---
+# ConfigMap: 模型配置
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: proxyllm-config
+  namespace: default
+data:
+  config.yaml: |
+    model_list:
+      - model_name: gpt-4
+        litellm_params:
+          model: openai/gpt-4
+          api_key: os.environ/OPENAI_API_KEY
+      - model_name: claude-sonnet
+        litellm_params:
+          model: anthropic/claude-sonnet-4-20250514
+          api_key: os.environ/ANTHROPIC_API_KEY
+
+---
+# Secret: 密钥和数据库连接
+apiVersion: v1
+kind: Secret
+metadata:
+  name: proxyllm-secrets
+  namespace: default
+type: Opaque
+stringData:
+  PROXY_MASTER_KEY: "sk-change-me-in-production"
+  DATABASE_URL: "postgresql://proxyllm:proxyllm-pass@postgres-svc:5432/proxyllm"
+  OPENAI_API_KEY: "sk-your-openai-key"
+  ANTHROPIC_API_KEY: "sk-ant-your-anthropic-key"
+
+---
+# Deployment: ProxyLLM
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: proxyllm
+  namespace: default
+  labels:
+    app: proxyllm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: proxyllm
+  template:
+    metadata:
+      labels:
+        app: proxyllm
+    spec:
+      containers:
+        - name: proxyllm
+          image: chaoseternal/proxyllm:latest
+          ports:
+            - containerPort: 4000
+              protocol: TCP
+          envFrom:
+            - secretRef:
+                name: proxyllm-secrets
+          volumeMounts:
+            - name: config
+              mountPath: /etc/litellm/config.yaml
+              subPath: config.yaml
+              readOnly: true
+            - name: data
+              mountPath: /home/litellm
+          readinessProbe:
+            httpGet:
+              path: /health/readiness
+              port: 4000
+            initialDelaySeconds: 60
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health/liveliness
+              port: 4000
+            initialDelaySeconds: 120
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+      volumes:
+        - name: config
+          configMap:
+            name: proxyllm-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: proxyllm-data
+
+---
+# Service: 暴露 ProxyLLM
+apiVersion: v1
+kind: Service
+metadata:
+  name: proxyllm-svc
+  namespace: default
+spec:
+  selector:
+    app: proxyllm
+  ports:
+    - port: 4000
+      targetPort: 4000
+      protocol: TCP
+  type: ClusterIP
+
+---
+# PVC: 数据持久化
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: proxyllm-data
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+
+---
+# PostgreSQL StatefulSet（可选，也可使用外部数据库）
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: default
+spec:
+  serviceName: postgres-svc
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: "proxyllm"
+            - name: POSTGRES_PASSWORD
+              value: "proxyllm-pass"
+            - name: POSTGRES_DB
+              value: "proxyllm"
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: pgdata
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 10Gi
+
+---
+# Service: PostgreSQL
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-svc
+  namespace: default
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+  type: ClusterIP
